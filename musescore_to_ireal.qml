@@ -6,7 +6,7 @@ import QtQuick.Dialogs 1.2
 MuseScore {
     version: "3.1"
     description: "Harmony analyzer with MuseScore barline detection and iReal Pro output"
-    menuPath: "Plugins.MusescoreToiReal"
+    menuPath: "export.ToiRealPro"
     requiresScore: true;
     QProcess {
          id: proc
@@ -15,6 +15,8 @@ MuseScore {
     property int barlineStartRepeat: 4
     property int barlineEndRepeat: 8
     property int barlineEndStartRepeat: 64
+    // Drošības limits GUI navigācijai, kas atrod VoltaSegment objektus.
+    property int maxVoltaNavigationSteps: 20000
 
 function convertHarmony(symbol) {
   //  symbol = symbol.charAt(0)+ symbol.substr(1);
@@ -28,6 +30,143 @@ function convertHarmony(symbol) {
     symbol = symbol.replace('N.C.', 'n');
     return symbol;
 }
+
+
+    function valueText(value) {
+        if (value === undefined || value === null)
+            return "undefined";
+        return "" + value;
+    }
+
+    function isChordOrRest(element) {
+        if (!element)
+            return false;
+
+        return element.type === Element.CHORD ||
+               element.type === Element.REST ||
+               element.name === "Chord" ||
+               element.name === "Rest";
+    }
+
+    function isVoltaSegment(element) {
+        if (!element)
+            return false;
+
+        return element.type === Element.VOLTA_SEGMENT ||
+               element.name === "VoltaSegment";
+    }
+
+    function selectedElementKey(element) {
+        if (!element)
+            return "null";
+
+        var key = valueText(element.name) + "|" +
+                  valueText(element.type) + "|" +
+                  valueText(element.volta_ending);
+
+        if (element.pagePos) {
+            key += "|" + valueText(element.pagePos.x) +
+                   "|" + valueText(element.pagePos.y);
+        }
+
+        return key;
+    }
+
+    function findFirstNavigableElement() {
+        var cursor = curScore.newCursor();
+
+        for (var staff = 0; staff < curScore.nstaves; staff++) {
+            for (var voice = 0; voice < 4; voice++) {
+                cursor.staffIdx = staff;
+                cursor.voice = voice;
+                cursor.rewind(Cursor.SCORE_START);
+
+                while (cursor.segment) {
+                    if (cursor.element)
+                        return cursor.element;
+                    cursor.next();
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /*
+       MuseScore 3 neuzrāda voltas measure.elements vai segment.annotations,
+       bet VoltaSegment ir sasniedzams ar cmd("next-element").
+       Tavā pārbaudē VoltaSegment parādās uzreiz pēc šīs takts Rest/Chord,
+       tādēļ N1/N2 tiek piesaistīts pēdējā apmeklētā Chord/Rest segmenta tick.
+    */
+    function collectVoltaTokensByMeasureTick() {
+        var voltaTokens = {};
+        var foundVoltas = {};
+        var visitedElements = {};
+        var firstElement = findFirstNavigableElement();
+
+        if (!firstElement) {
+            console.log("Voltu meklēšana: nav sākuma Chord/Rest elementa.");
+            return voltaTokens;
+        }
+
+        var selectedOk = curScore.selection.select(firstElement, false);
+        console.log("Voltu meklēšana: sākuma elements = " +
+                    valueText(firstElement.name) +
+                    ", select = " + valueText(selectedOk));
+
+        var lastChordRestTick = -1;
+        var previousKey = "";
+        var unchangedCount = 0;
+
+        for (var step = 0; step < maxVoltaNavigationSteps; step++) {
+            var selectionElements = curScore.selection.elements;
+
+            if (!selectionElements || selectionElements.length === 0)
+                break;
+
+            var selected = selectionElements[0];
+            var currentKey = selectedElementKey(selected);
+
+            if (currentKey === previousKey) {
+                unchangedCount++;
+                if (unchangedCount >= 5)
+                    break;
+            } else {
+                unchangedCount = 0;
+            }
+            previousKey = currentKey;
+
+            if (isChordOrRest(selected) &&
+                selected.parent &&
+                selected.parent.tick !== undefined) {
+                lastChordRestTick = Number(selected.parent.tick);
+            }
+
+            if (isVoltaSegment(selected)) {
+                var endingNumber = Number(selected.volta_ending);
+                var token = "N" + endingNumber;
+                var foundKey = token + "|" + lastChordRestTick;
+
+                if (lastChordRestTick >= 0 &&
+                    !isNaN(endingNumber) &&
+                    foundVoltas[foundKey] !== true) {
+                    foundVoltas[foundKey] = true;
+                    voltaTokens["" + lastChordRestTick] = token;
+                    console.log("Atrasta volta: " + token +
+                                ", piesaistīta takts tick = " +
+                                lastChordRestTick);
+                }
+            }
+
+            if (visitedElements[currentKey] === true && step > 0)
+                break;
+
+            visitedElements[currentKey] = true;
+            cmd("next-element");
+        }
+
+        return voltaTokens;
+    }
 
     MessageDialog {
         id: successDialog
@@ -66,6 +205,9 @@ function convertHarmony(symbol) {
         var currentBarStartTick = 0;
         var currentBarTicks = division * 4;
         var measureText = "";
+
+        // iReal Pro voltas marķieri: N1, N2, N3 pirms attiecīgās takts satura.
+        var voltaTokensByMeasureTick = collectVoltaTokensByMeasureTick();
 
         // Helper functions for time signatures and beat positions.
         function beatTicksForTimeSignature(timeSig) {
@@ -361,6 +503,13 @@ function convertHarmony(symbol) {
                 if (!firstMeasure && iReal.charAt(iReal.length - 1) === "|")
                     iReal = iReal.substr(0, iReal.length - 1);
                 iReal += "{";
+            }
+
+            var voltaToken = voltaTokensByMeasureTick["" + currentBarStartTick];
+            if (voltaToken !== undefined && voltaToken !== null) {
+                iReal += voltaToken;
+                console.log("Takts " + measureNumber +
+                            ": pievienots voltas marķieris " + voltaToken);
             }
 
             measureText = buildMeasureTextFromChordDurations(measure, measureNumber);
