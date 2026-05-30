@@ -1,3 +1,33 @@
+//=============================================================================
+//  MuseScore to iReal Pro Export Plugin
+//
+//  Based in part on the MuseScore iRealPro plugin by Norman Schmidt.
+//
+//  Original code:
+//  Copyright (c) 2017 Norman Schmidt
+//
+//  Modifications and additional functionality:
+//  Copyright (c) 2026 Ilvis Faulbaums
+//
+//  Modified by Ilvis Faulbaums on 2026-05-31.
+//  Changes include chord-grid export logic, MuseScore repeat-barline handling,
+//  time-signature export, automatic volta detection, and iReal Pro output.
+//
+//  This program is free software; you can redistribute it and/or modify
+//  it under the terms of the GNU General Public License version 2
+//  as published by the Free Software Foundation.
+//
+//  This program is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+//  GNU General Public License version 2 for more details.
+//
+//  You should have received a copy of the GNU General Public License
+//  version 2 along with this program. If not, see
+//  https://www.gnu.org/licenses/old-licenses/gpl-2.0.html.
+//=============================================================================
+
+
 import QtQuick 2.0
 import MuseScore 3.0
 import FileIO 3.0
