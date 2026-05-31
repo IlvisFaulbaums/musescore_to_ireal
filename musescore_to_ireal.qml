@@ -45,8 +45,30 @@ MuseScore {
     property int barlineStartRepeat: 4
     property int barlineEndRepeat: 8
     property int barlineEndStartRepeat: 64
-    // Drošības limits GUI navigācijai, kas atrod VoltaSegment objektus.
-    property int maxVoltaNavigationSteps: 20000
+    // Voltu navigācija notiek mazās porcijās, lai gara partitūra neuzkārtu interfeisu.
+    property int voltaStepsPerBatch: 10
+    property int maxVoltaNavigationSteps: 200000
+
+    property var collectedVoltaTokens: ({})
+    property var foundVoltasDuringNavigation: ({})
+    property var visitedVoltaNavigationElements: ({})
+    property string previousVoltaNavigationKey: ""
+    property int unchangedVoltaNavigationCount: 0
+    property int voltaNavigationStep: 0
+    property int lastNavigatedChordRestTick: -1
+    property var voltaNavigationStartElement: null
+    property bool voltaSearchRunning: false
+
+    Timer {
+        id: voltaNavigationTimer
+        interval: 1
+        repeat: true
+        running: false
+
+        onTriggered: {
+            processNextVoltaNavigationBatch();
+        }
+    }
 
 function convertHarmony(symbol) {
   //  symbol = symbol.charAt(0)+ symbol.substr(1);
@@ -102,8 +124,21 @@ function convertHarmony(symbol) {
         return key;
     }
 
-    function findFirstNavigableElement() {
+    /*
+       Katras palaišanas sākumā atrod pirmo muzikālo notikumu pēc mazākā tick.
+       Ja tas ir CHORD, lietotāja sākuma atlase ir tā pirmā NOTE.
+       Ja tas ir REST, lietotāja sākuma atlase ir pati pauze.
+       Savukārt next-element voltu navigācijai tiek glabāts CHORD/REST objekts,
+       jo MuseScore 3 no NOTE ne vienmēr nonāk līdz VoltaSegment.
+    */
+    function selectFirstNoteOrRestBeforeNavigation() {
+        var bestElement = null;
+        var bestTick = -1;
         var cursor = curScore.newCursor();
+
+        // Neizmanto iepriekšējās palaišanas atlasi vai saglabāto objektu.
+        voltaNavigationStartElement = null;
+        cmd("escape");
 
         for (var staff = 0; staff < curScore.nstaves; staff++) {
             for (var voice = 0; voice < 4; voice++) {
@@ -112,90 +147,210 @@ function convertHarmony(symbol) {
                 cursor.rewind(Cursor.SCORE_START);
 
                 while (cursor.segment) {
-                    if (cursor.element)
-                        return cursor.element;
+                    var element = cursor.element;
+
+                    if (isChordOrRest(element)) {
+                        var elementTick = selectedMusicalTick(element);
+
+                        if (elementTick >= 0 &&
+                            (bestElement === null || elementTick < bestTick)) {
+                            bestElement = element;
+                            bestTick = elementTick;
+                        }
+
+                        // Šajā balsī pirmais Chord/Rest jau ir agrākais.
+                        break;
+                    }
+
                     cursor.next();
                 }
             }
         }
 
-        return null;
+        if (!bestElement) {
+            console.log("Voltu meklēšana: nav atrasta ne nots, ne pauze.");
+            return false;
+        }
+
+        // Navigācijas sākumpunkts vienmēr ir Chord vai Rest.
+        voltaNavigationStartElement = bestElement;
+
+        // Lietotāja prasītā sākuma atlase: pirmā NOTE vai pirmā REST.
+        if ((bestElement.type === Element.CHORD || bestElement.name === "Chord") &&
+            bestElement.notes && bestElement.notes.length > 0) {
+            curScore.selection.select(bestElement.notes[0], false);
+            console.log("Voltu meklēšana: automātiski izvēlēta pirmā NOTS, tick = " +
+                        valueText(bestTick));
+        } else {
+            curScore.selection.select(bestElement, false);
+            console.log("Voltu meklēšana: automātiski izvēlēta pirmā PAUZE, tick = " +
+                        valueText(bestTick));
+        }
+
+        return true;
+    }
+
+    // Iegūst segmenta tick arī tad, ja pašlaik ir izvēlēta pati NOTE.
+    function selectedMusicalTick(element) {
+        var current = element;
+
+        for (var level = 0; current && level < 6; level++) {
+            if (current.tick !== undefined)
+                return Number(current.tick);
+            current = current.parent;
+        }
+
+        return -1;
+    }
+
+    function startVoltaNavigation() {
+        collectedVoltaTokens = {};
+        foundVoltasDuringNavigation = {};
+        visitedVoltaNavigationElements = {};
+        previousVoltaNavigationKey = "";
+        unchangedVoltaNavigationCount = 0;
+        voltaNavigationStep = 0;
+        lastNavigatedChordRestTick = -1;
+
+        if (!voltaNavigationStartElement) {
+            console.log("Voltu meklēšana: nav Chord/Rest sākuma elementa.");
+            exportToIReal(collectedVoltaTokens);
+            return;
+        }
+
+        // Sākumā jau tika automātiski izvēlēta pirmā NOTE vai REST.
+        // Pirms next-element navigācijas CHORD/REST ir vajadzīgs tehniski,
+        // lai MuseScore 3 navigācijas ķēde sasniegtu VoltaSegment.
+        curScore.selection.select(voltaNavigationStartElement, false);
+        console.log("Voltu meklēšana: next-element sākts no pirmā " +
+                    valueText(voltaNavigationStartElement.name) + ".");
+
+        voltaSearchRunning = true;
+        voltaNavigationTimer.start();
+    }
+
+    function finishVoltaNavigation() {
+        voltaNavigationTimer.stop();
+        voltaSearchRunning = false;
+
+        console.log("Voltu meklēšana pabeigta; sākas iReal eksports.");
+        exportToIReal(collectedVoltaTokens);
+    }
+
+    /*
+       VoltaSegment navigācijas secībā var parādīties tikai pēc visu nošu/akordu
+       izstaigāšanas. Tāpēc volta NEVAR tikt piesaistīta pēdējam navigētajam
+       akordam. Jāņem pašas voltas spanner sākuma tick.
+    */
+    function getVoltaStartTick(voltaSegment) {
+        if (!voltaSegment)
+            return -1;
+
+        if (voltaSegment.spanner) {
+            if (voltaSegment.spanner.tick !== undefined) {
+                var directSpannerTick = Number(voltaSegment.spanner.tick);
+                if (!isNaN(directSpannerTick))
+                    return directSpannerTick;
+            }
+
+            if (voltaSegment.spanner.startElement) {
+                var startElementTick = selectedMusicalTick(voltaSegment.spanner.startElement);
+                if (startElementTick >= 0 && !isNaN(startElementTick))
+                    return startElementTick;
+            }
+        }
+
+        if (voltaSegment.tick !== undefined) {
+            var segmentTick = Number(voltaSegment.tick);
+            if (!isNaN(segmentTick))
+                return segmentTick;
+        }
+
+        if (voltaSegment.parent && voltaSegment.parent.tick !== undefined) {
+            var parentTick = Number(voltaSegment.parent.tick);
+            if (!isNaN(parentTick))
+                return parentTick;
+        }
+
+        // Tikai rezerves variants debugam; īstajā gadījumā jāatrod spanner.tick.
+        return lastNavigatedChordRestTick;
     }
 
     /*
        MuseScore 3 neuzrāda voltas measure.elements vai segment.annotations,
        bet VoltaSegment ir sasniedzams ar cmd("next-element").
-       Tavā pārbaudē VoltaSegment parādās uzreiz pēc šīs takts Rest/Chord,
-       tādēļ N1/N2 tiek piesaistīts pēdējā apmeklētā Chord/Rest segmenta tick.
+       Timer sadala navigāciju porcijās, lai gara partitūra neaizturētu UI.
     */
-    function collectVoltaTokensByMeasureTick() {
-        var voltaTokens = {};
-        var foundVoltas = {};
-        var visitedElements = {};
-        var firstElement = findFirstNavigableElement();
+    function processNextVoltaNavigationBatch() {
+        if (!voltaSearchRunning)
+            return;
 
-        if (!firstElement) {
-            console.log("Voltu meklēšana: nav sākuma Chord/Rest elementa.");
-            return voltaTokens;
-        }
+        for (var batchStep = 0; batchStep < voltaStepsPerBatch; batchStep++) {
+            if (voltaNavigationStep >= maxVoltaNavigationSteps) {
+                console.log("Voltu meklēšana: sasniegts drošības limits " +
+                            maxVoltaNavigationSteps + ".");
+                finishVoltaNavigation();
+                return;
+            }
 
-        var selectedOk = curScore.selection.select(firstElement, false);
-        console.log("Voltu meklēšana: sākuma elements = " +
-                    valueText(firstElement.name) +
-                    ", select = " + valueText(selectedOk));
-
-        var lastChordRestTick = -1;
-        var previousKey = "";
-        var unchangedCount = 0;
-
-        for (var step = 0; step < maxVoltaNavigationSteps; step++) {
             var selectionElements = curScore.selection.elements;
-
-            if (!selectionElements || selectionElements.length === 0)
-                break;
+            if (!selectionElements || selectionElements.length === 0) {
+                console.log("Voltu meklēšana: pazuda izvēlētais elements.");
+                finishVoltaNavigation();
+                return;
+            }
 
             var selected = selectionElements[0];
             var currentKey = selectedElementKey(selected);
 
-            if (currentKey === previousKey) {
-                unchangedCount++;
-                if (unchangedCount >= 5)
-                    break;
+            if (currentKey === previousVoltaNavigationKey) {
+                unchangedVoltaNavigationCount++;
+                if (unchangedVoltaNavigationCount >= 5) {
+                    finishVoltaNavigation();
+                    return;
+                }
             } else {
-                unchangedCount = 0;
+                unchangedVoltaNavigationCount = 0;
             }
-            previousKey = currentKey;
+            previousVoltaNavigationKey = currentKey;
 
-            if (isChordOrRest(selected) &&
-                selected.parent &&
-                selected.parent.tick !== undefined) {
-                lastChordRestTick = Number(selected.parent.tick);
+            // Atceras pēdējā apmeklētā muzikālā elementa tick rezerves variantam.
+            if (isChordOrRest(selected) ||
+                selected.type === Element.NOTE ||
+                selected.name === "Note") {
+                var musicalTick = selectedMusicalTick(selected);
+                if (musicalTick >= 0 && !isNaN(musicalTick))
+                    lastNavigatedChordRestTick = musicalTick;
             }
 
             if (isVoltaSegment(selected)) {
                 var endingNumber = Number(selected.volta_ending);
                 var token = "N" + endingNumber;
-                var foundKey = token + "|" + lastChordRestTick;
+                var voltaStartTick = getVoltaStartTick(selected);
+                var foundKey = token + "|" + voltaStartTick;
 
-                if (lastChordRestTick >= 0 &&
+                console.log("VoltaSegment atrasts: ending = " + valueText(endingNumber) +
+                            ", spannerTick/sākuma tick = " + valueText(voltaStartTick));
+
+                if (voltaStartTick >= 0 &&
                     !isNaN(endingNumber) &&
-                    foundVoltas[foundKey] !== true) {
-                    foundVoltas[foundKey] = true;
-                    voltaTokens["" + lastChordRestTick] = token;
+                    foundVoltasDuringNavigation[foundKey] !== true) {
+                    foundVoltasDuringNavigation[foundKey] = true;
+                    collectedVoltaTokens["" + voltaStartTick] = token;
+
                     console.log("Atrasta volta: " + token +
-                                ", piesaistīta takts tick = " +
-                                lastChordRestTick);
+                                ", piesaistīta SĀKUMA takts tick = " +
+                                voltaStartTick);
                 }
             }
 
-            if (visitedElements[currentKey] === true && step > 0)
-                break;
-
-            visitedElements[currentKey] = true;
+            // Te apzināti nav visitedElements pārtraukuma. Dažādi MuseScore
+            // elementi var dot vienādu atslēgu; tas agrāk apturēja meklēšanu,
+            // pirms VoltaSegment bija sasniegts. Galu nosaka tikai 5 reizes
+            // nemainīga atlase vai maxVoltaNavigationSteps.
+            voltaNavigationStep++;
             cmd("next-element");
         }
-
-        return voltaTokens;
     }
 
     MessageDialog {
@@ -221,7 +376,7 @@ function convertHarmony(symbol) {
         onError: console.log("FileIO Error:", msg)
     }
 
-    onRun: {
+    function exportToIReal(voltaTokensByMeasureTick) {
         if (!curScore) {
             Qt.quit();
             return;
@@ -236,9 +391,7 @@ function convertHarmony(symbol) {
         var currentBarTicks = division * 4;
         var measureText = "";
 
-        // iReal Pro voltas marķieri: N1, N2, N3 pirms attiecīgās takts satura.
-        var voltaTokensByMeasureTick = collectVoltaTokensByMeasureTick();
-
+        // voltaTokensByMeasureTick jau tika savākti ar Timer navigācijas fāzē.
         // Helper functions for time signatures and beat positions.
         function beatTicksForTimeSignature(timeSig) {
             var parts = timeSig.match(/(\d+)\/(\d+)/);
@@ -623,5 +776,21 @@ function convertHarmony(symbol) {
             errorDialog.visible = true;
            }
         Qt.quit();
+    }
+
+    onRun: {
+        if (!curScore) {
+            Qt.quit();
+            return;
+        }
+
+        // Katrā palaišanas reizē nomet veco atlasi un automātiski izvēlas
+        // pirmo NOTI vai PAUZI partitūras sākumā.
+        if (!selectFirstNoteOrRestBeforeNavigation()) {
+            Qt.quit();
+            return;
+        }
+
+        startVoltaNavigation();
     }
 }
