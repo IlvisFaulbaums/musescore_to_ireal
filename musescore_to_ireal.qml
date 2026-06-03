@@ -35,7 +35,7 @@ import QtQuick.Dialogs 1.2
 
 MuseScore {
     version: "3.1"
-    description: "iReal export: no final Z after ending repeat"
+    description: "iReal export"
     menuPath: "export.ToiRealPro"
     requiresScore: true;
     QProcess {
