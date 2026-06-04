@@ -9,7 +9,7 @@
 //  Modifications and additional functionality:
 //  Copyright (c) 2026 Ilvis Faulbaums
 //
-//  Modified by Ilvis Faulbaums on 2026-05-31.
+//  Modified by Ilvis Faulbaums on 2026-06-01.
 //  Changes include chord-grid export logic, MuseScore repeat-barline handling,
 //  time-signature export, automatic volta detection, and iReal Pro output.
 //
@@ -49,6 +49,17 @@ MuseScore {
     // Voltu navigācija notiek mazās porcijās, lai gara partitūra neuzkārtu interfeisu.
     property int voltaStepsPerBatch: 10
     property int maxVoltaNavigationSteps: 200000
+
+    // Diagnostikas režīms: akordu/taktu struktūru nemaina.
+    // Tempo staff-text ir protokolā atļauts, bet tiek izslēgts, lai izolētu
+    // konkrētās partitūras importēšanas uzkāršanos.
+    property bool includeTempoStaffText: true
+
+    // Automātiska akordu izmēra izvēle iReal Pro:
+    // 3 vai vairāk jauni Harmony simboli vienā taktī -> small režīms "s".
+    // Katrs N.C., kas eksportā ir "n", VIENMĒR kļūst par "sn".
+    // Retākā taktī parasts akords tiek atjaunots uz large ar "l".
+    property int smallChordThreshold: 3
 
     property var collectedVoltaTokens: ({})
     property var foundVoltasDuringNavigation: ({})
@@ -391,6 +402,8 @@ function convertHarmony(symbol) {
         var currentBarStartTick = 0;
         var currentBarTicks = division * 4;
         var measureText = "";
+        // iReal "s" un "l" ir noturīgi līdz nākamajai izmēra komandai.
+        var smallChordModeActive = false;
 
         // voltaTokensByMeasureTick jau tika savākti ar Timer navigācijas fāzē.
         // Helper functions for time signatures and beat positions.
@@ -508,6 +521,22 @@ function convertHarmony(symbol) {
         // A -> *A, B -> *B, C -> *C, D -> *D,
         // V/Verse -> *V, i/Intro -> *i,
         // S/Segno -> S, Q/Coda -> Q, f/Fermata -> f.
+        // Brīvs MuseScore teksts / lirikas fragments iReal formātā.
+        // Piem.: "Ve - ni sancte spiritus, " -> "<Ve - ni sancte spiritus, >"
+        function plainTextToIRealStaffText(text) {
+            var original = (text === undefined || text === null) ? "" : ("" + text);
+            var cleaned = original.replace(/[\r\n]+/g, " ")
+                                  .replace(/\s+/g, " ")
+                                  .replace(/^\s+|\s+$/g, "")
+                                  .replace(/</g, "(")
+                                  .replace(/>/g, ")");
+
+            if (cleaned === "")
+                return "";
+
+            return "<" + cleaned + ">";
+        }
+
         function rehearsalTextToIRealToken(text) {
             var original = (text === undefined || text === null) ? "" : ("" + text);
             var cleaned = original.replace(/^\s+|\s+$/g, "");
@@ -530,8 +559,10 @@ function convertHarmony(symbol) {
             // kā Marker elements un iReal eksportā kļūst par "S".
 
 
-            console.log("Rehearsal mark nav iReal kartē: \"" + original + "\"; izlaists.");
-            return "";
+            var lyricToken = plainTextToIRealStaffText(original);
+            console.log("Brīvs Rehearsal Mark teksts: \"" + original +
+                        "\" -> iReal " + lyricToken);
+            return lyricToken;
         }
 
         function isRehearsalMark(element) {
@@ -561,6 +592,58 @@ function convertHarmony(symbol) {
                                 console.log("Rehearsal mark: \"" + annotation.text +
                                             "\" -> iReal " + token +
                                             ", tick " + segment.tick);
+                            }
+                        }
+                    }
+                }
+                segment = segment.nextInMeasure;
+            }
+
+            return tokens.join("");
+        }
+
+        // Nolasa parastus MuseScore Staff Text / System Text elementus kā iReal staff text.
+        // Navigācijas un struktūras elementi šeit tiek izlaisti, jo tos lasa atsevišķi.
+        function isFreeTextElement(element) {
+            if (!element)
+                return false;
+
+            var name = (element.name === undefined || element.name === null)
+                     ? ""
+                     : ("" + element.name);
+
+            return name === "StaffText" ||
+                   name === "Staff Text" ||
+                   name === "SystemText" ||
+                   name === "System Text" ||
+                   name === "Text";
+        }
+
+        function getFreeTextTokensForMeasure(measure) {
+            var tokens = [];
+            var alreadyAdded = {};
+            var segment = measure.firstSegment;
+
+            while (segment) {
+                if (segment.annotations) {
+                    for (var i = 0; i < segment.annotations.length; i++) {
+                        var annotation = segment.annotations[i];
+
+                        // Rehearsal, Tempo, Jump un Marker apstrādā citas funkcijas.
+                        if (isFreeTextElement(annotation) &&
+                            !isRehearsalMark(annotation) &&
+                            !isMarkerElement(annotation) &&
+                            !isJumpElement(annotation) &&
+                            annotation.name !== "Tempo") {
+
+                            var token = plainTextToIRealStaffText(annotation.text);
+                            var key = "" + segment.tick + "|" + token;
+
+                            if (token !== "" && alreadyAdded[key] !== true) {
+                                alreadyAdded[key] = true;
+                                tokens.push(token);
+                                console.log("Staff/System Text pie tick " + segment.tick +
+                                            " -> iReal " + token);
                             }
                         }
                     }
@@ -664,6 +747,15 @@ function convertHarmony(symbol) {
                         addUnique("beforeBoundary", "|Q", "Marker To Coda (label=coda)");
                     } else if (label === "fine") {
                         addUnique("beforeBoundary", "|<Fine>", "Marker Fine (label=fine)");
+                    } else {
+                        // Visi pārējie Marker elementi tiek rādīti kā brīvs teksts/lirika.
+                        var markerText = (element.text !== undefined && element.text !== null &&
+                                          ("" + element.text).replace(/^\s+|\s+$/g, "") !== "")
+                                       ? element.text
+                                       : element.label;
+                        var markerToken = plainTextToIRealStaffText(markerText);
+                        addUnique("beforeChord", markerToken,
+                                  "Brīvs Marker teksts \"" + markerText + "\"");
                     }
                 }
 
@@ -673,8 +765,11 @@ function convertHarmony(symbol) {
                         addUnique("beforeBoundary", jumpToken,
                                   "Jump \"" + normalizedNavigationText(element.text) + "\"");
                     } else {
-                        console.log("Jump nav iReal kartē: \"" +
-                                    normalizedNavigationText(element.text) + "\"; izlaists.");
+                        // Nezināms Jump teksts nav vadības komanda: rāda kā brīvu tekstu.
+                        var freeJumpText = normalizedNavigationText(element.text);
+                        var freeJumpToken = plainTextToIRealStaffText(freeJumpText);
+                        addUnique("beforeBoundary", freeJumpToken,
+                                  "Brīvs Jump teksts \"" + freeJumpText + "\"");
                     }
                 }
             }
@@ -941,6 +1036,22 @@ function convertHarmony(symbol) {
             return beatTicks;
         }
 
+        // Ievieto iReal izmēra komandu tieši pirms pirmā akorda vai N.C. simbola.
+        // Piem.: ",D," + "s" -> ",sD,"; ",n," + "s" -> ",sn,".
+        // "n" ir iReal N.C. apzīmējums, tādēļ tam arī jāseko small/large režīmam.
+        function insertChordSizeTokenBeforeFirstChord(output, sizeToken) {
+            if (!output || !sizeToken)
+                return output;
+
+            for (var i = 0; i < output.length; i++) {
+                var character = output.charAt(i);
+                if ("ABCDEFGn".indexOf(character) >= 0)
+                    return output.substr(0, i) + sizeToken + output.substr(i);
+            }
+
+            return output;
+        }
+
         // Veido tieši tik iReal šūnu, cik taktī ir sitienu/izvēlētā režģa vienību.
         // Akorda teksts pats jau aizņem vienu šūnu:
         // 4/4 ar C visu takti => ,C, , ,    (nevis ,C, , , , )
@@ -1006,11 +1117,76 @@ function convertHarmony(symbol) {
                 }
 
                 if (activeChord === "") {
-                    output += ",n";
+                    // iReal N.C. vizuāli ir liels, tādēļ to vienmēr rāda small režīmā.
+                    output += ",sn";
                 } else if (newChordAtThisCell || cell === 0) {
-                    output += "," + activeChord + ",";
+                    // MuseScore Harmony "N.C." funkcijā convertHarmony() kļūst par "n".
+                    // Arī šim gadījumam neatkarīgi no takts blīvuma vienmēr lieto "sn".
+                    var outputHarmony = (activeChord === "n") ? "sn" : activeChord;
+                    output += "," + outputHarmony + ",";
                 } else {
                     output += " ";
+                }
+            }
+
+            // Vietas taupīšana iReal kartē:
+            // ja šajā taktī ir tieši viens JAUNS akords un tas sākas pirmajā sitienā,
+            // nevajag izvadīt tukšās turpinājuma šūnas līdz takts beigām.
+            // Piem.: ",D,   " -> ",D," un ",A,   " -> ",A,".
+            //
+            // Ja vēlāk tajā pašā taktī ir fermata, atstarpes saglabā,
+            // jo tās nosaka fermatas ritmisko pozīciju.
+            var singleChordOnFirstBeat = harmonies.length === 1 &&
+                                         Math.abs(harmonies[0].tick - measureStartTick) < 0.001;
+            var hasLaterFermata = false;
+
+            for (var compactFermataIndex = 0;
+                 compactFermataIndex < fermataTicks.length;
+                 compactFermataIndex++) {
+                if (fermataTicks[compactFermataIndex] > measureStartTick + 0.001) {
+                    hasLaterFermata = true;
+                    break;
+                }
+            }
+
+            if (singleChordOnFirstBeat && !hasLaterFermata) {
+                output = output.replace(/\s+$/g, "");
+                console.log("Takts " + measureNumber +
+                            ": viens akords pirmajā sitienā; noņemtas beigu tukšās šūnas.");
+            }
+
+            // Katrs "sn" pats ieslēdz small režīmu, jo "s" iReal virknē ir noturīgs.
+            // Tāpēc pēc N.C. nākamais parastais retas takts akords saņems "l".
+            var outputContainsSmallNc = output.indexOf("sn") >= 0;
+            if (outputContainsSmallNc) {
+                smallChordModeActive = true;
+                console.log("Takts " + measureNumber +
+                            ": N.C. eksportēts kā sn; small režīms ir aktīvs.");
+            }
+
+            // Blīva takts: ja tajā ierakstīti vismaz smallChordThreshold akordi,
+            // ieslēdz "s". Ja "sn" jau atrodas taktī, papildu "s" nav vajadzīgs.
+            // Kad nākamā takts ar īstu akordu atkal ir vienkārša, izvada "l".
+            var denseChordMeasure = harmonies.length >= smallChordThreshold;
+            var sizedOutput = output;
+
+            if (denseChordMeasure && !smallChordModeActive) {
+                sizedOutput = insertChordSizeTokenBeforeFirstChord(output, "s");
+                if (sizedOutput !== output) {
+                    output = sizedOutput;
+                    smallChordModeActive = true;
+                    console.log("Takts " + measureNumber +
+                                ": blīva takts (" + harmonies.length +
+                                " akordi), ieslēgts small režīms s.");
+                }
+            } else if (!denseChordMeasure && smallChordModeActive &&
+                       !outputContainsSmallNc) {
+                sizedOutput = insertChordSizeTokenBeforeFirstChord(output, "l");
+                if (sizedOutput !== output) {
+                    output = sizedOutput;
+                    smallChordModeActive = false;
+                    console.log("Takts " + measureNumber +
+                                ": retāka takts ar parastu akordu, atjaunots large režīms l.");
                 }
             }
 
@@ -1077,6 +1253,7 @@ function convertHarmony(symbol) {
             measureNumber++;
             var repeats = getMeasureBarlines(measure);
             var rehearsalToken = getRehearsalTokenForMeasure(measure);
+            var freeTextToken = getFreeTextTokensForMeasure(measure);
             var navigationTokens = getRepeatNavigationTokensForMeasure(measure);
             var timeSignatureToken = getTimeSignatureTokenForMeasure(measure, firstMeasure);
             // Harmony ticki ir segment.tick koordinātēs, tādēļ arī takts
@@ -1102,8 +1279,10 @@ function convertHarmony(symbol) {
                 else
                     iReal += "[";
 
-                // iReal nav BPM metadatu lauka; rādām pirmo score tempu virs pirmās takts.
-                iReal += firstTempoInfo.token;
+                // Diagnostikas režīmā neievieto <*74Tempo: ...> akordu tekstā.
+                // Akordu/taktu virkne paliek tā pati kā strādājošajā HTML piemērā.
+                if (includeTempoStaffText)
+                    iReal += firstTempoInfo.token;
             } else {
                 // Taktsmērs joprojām pieder pirms robežas, kura ievada takti.
                 insertBeforePreviousBoundary(timeSignatureToken);
@@ -1143,6 +1322,15 @@ function convertHarmony(symbol) {
                 console.log("Takts " + measureNumber +
                             ": sākuma navigācijas marķieris = " +
                             navigationTokens.beforeChord);
+            }
+
+            // Parasts Staff/System Text tiek rādīts kā iReal staff text/lirika
+            // tieši pirms šīs takts akordu satura:
+            // <Ve - ni sancte spiritus, >,A,   |
+            if (freeTextToken !== "") {
+                iReal += freeTextToken;
+                console.log("Takts " + measureNumber +
+                            ": brīvs teksts/lirika = " + freeTextToken);
             }
 
             measureText = buildMeasureTextFromChordDurations(measure, measureNumber);
@@ -1197,8 +1385,20 @@ function convertHarmony(symbol) {
         console.log("iReal Pro format with iReal barline markers:");
         console.log(iReal);
 
-        var title = curScore.title || "Untitled";
-        var composer = curScore.composer || "Unknown";
+        function safeHeaderField(value, fallback) {
+            var field = (value === undefined || value === null || ("" + value) === "")
+                      ? fallback
+                      : ("" + value);
+
+            // '=' dala iReal laukus; jaunas rindas URL laukā rada parsera risku.
+            return field.replace(/[\\r\\n]+/g, " ")
+                        .replace(/=/g, "-")
+                        .replace(/\\s+/g, " ")
+                        .replace(/^\\s+|\\s+$/g, "");
+        }
+
+        var title = safeHeaderField(curScore.title, "Untitled");
+        var composer = safeHeaderField(curScore.composer, "Unknown");
         var offset = title.indexOf(" by ");
         if (offset > 0) {
             var tempTitle = title;
@@ -1206,9 +1406,18 @@ function convertHarmony(symbol) {
             composer = tempTitle.substring(offset + 4);
         }
 
-        var composerParts = composer.split(" ");
-        if (composerParts.length === 2)
-            composer = composerParts[1] + " " + composerParts[0];
+        // Saglabā autora vārdu secību; automātiska "uzvārds vārds"
+        // apgriešana šim eksportam nav vajadzīga.
+
+        // Pēc iespējamās pārdalīšanas vēlreiz noņem parserim bīstamus atdalītājus.
+        title = safeHeaderField(title, "Untitled");
+        composer = safeHeaderField(composer, "Unknown");
+
+        // iReal galvenē autors tiek saīsināts līdz pirmajiem 2 vārdiem.
+        // Piem.: "Tautas mūzika postfolkloras grupas ..." -> "Tautas mūzika".
+        var composerWords = composer.split(" ");
+        if (composerWords.length > 2)
+            composer = composerWords[0] + " " + composerWords[1];
 
         // iReal tonalitātes lauku aizpilda no pirmā Harmony akorda saknes.
         // Ja Harmony nav, getKeyFromFirstHarmony() jau atgrieza key-signature fallback.
