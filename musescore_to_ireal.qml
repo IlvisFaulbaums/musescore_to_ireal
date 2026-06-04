@@ -9,7 +9,7 @@
 //  Modifications and additional functionality:
 //  Copyright (c) 2026 Ilvis Faulbaums
 //
-//  Modified by Ilvis Faulbaums on 2026-06-01.
+//  Modified by Ilvis Faulbaums on 2026-05-31.
 //  Changes include chord-grid export logic, MuseScore repeat-barline handling,
 //  time-signature export, automatic volta detection, and iReal Pro output.
 //
@@ -34,9 +34,9 @@ import FileIO 3.0
 import QtQuick.Dialogs 1.2
 
 MuseScore {
-    version: "3.1"
-    description: "iReal export"
-    menuPath: "export.ToiRealPro"
+    version: "3.1-open-html-with-irealpro"
+    description: "iReal export: open HTML with iReal Pro"
+    menuPath: "export.ToiRealPro OPEN HTML WITH IREALPRO"
     requiresScore: true;
     QProcess {
          id: proc
@@ -60,6 +60,11 @@ MuseScore {
     // Katrs N.C., kas eksportā ir "n", VIENMĒR kļūst par "sn".
     // Retākā taktī parasts akords tiek atjaunots uz large ar "l".
     property int smallChordThreshold: 3
+
+    // macOS: atver saglabāto HTML failu tieši ar iReal Pro.
+    // Tavā Terminalī strādājošā sintakse:
+    // open -a "iReal Pro" /Users/rat/Desktop/irealpro_chart.html
+    property bool autoOpenGeneratedHtmlWithIRealPro: true
 
     property var collectedVoltaTokens: ({})
     property var foundVoltasDuringNavigation: ({})
@@ -386,6 +391,35 @@ function convertHarmony(symbol) {
     FileIO {
         id: fileIO
         onError: console.log("FileIO Error:", msg)
+    }
+
+    // Aizsargā faila ceļu macOS open komandas argumentam.
+    function quoteForMacOpen(value) {
+        var safe = (value === undefined || value === null) ? "" : ("" + value);
+        safe = safe.replace(/[\r\n]+/g, " ")
+                   .replace(/\\/g, "\\\\")
+                   .replace(/"/g, "\\\"");
+        return "\"" + safe + "\"";
+    }
+
+    function openGeneratedHtmlDirectlyWithIRealPro(htmlPath) {
+        if (!autoOpenGeneratedHtmlWithIRealPro)
+            return false;
+
+        // Precīzi tavā Terminalī strādājošā forma:
+        // /usr/bin/open -a "iReal Pro" "/Users/rat/Desktop/irealpro_chart.html"
+        // fileIO.homePath() uz tava Mac automātiski iedod /Users/rat.
+        var command = "/usr/bin/open -a " +
+                      quoteForMacOpen("iReal Pro") + " " +
+                      quoteForMacOpen(htmlPath);
+
+        console.log("Atver HTML tieši ar iReal Pro:");
+        console.log(command);
+
+        proc.start(command);
+        var finished = proc.waitForFinished(5000);
+        console.log("open -a iReal Pro HTML pabeigts = " + valueText(finished));
+        return finished;
     }
 
     function exportToIReal(voltaTokensByMeasureTick) {
@@ -1391,10 +1425,10 @@ function convertHarmony(symbol) {
                       : ("" + value);
 
             // '=' dala iReal laukus; jaunas rindas URL laukā rada parsera risku.
-            return field.replace(/[\\r\\n]+/g, " ")
+            return field.replace(/[\r\n]+/g, " ")
                         .replace(/=/g, "-")
-                        .replace(/\\s+/g, " ")
-                        .replace(/^\\s+|\\s+$/g, "");
+                        .replace(/\s+/g, " ")
+                        .replace(/^\s+|\s+$/g, "");
         }
 
         var title = safeHeaderField(curScore.title, "Untitled");
@@ -1461,6 +1495,13 @@ function convertHarmony(symbol) {
         fileIO.source = filePath;
             
         if (fileIO.write(htmlContent)){
+            var openedInIReal = openGeneratedHtmlDirectlyWithIRealPro(filePath);
+
+            if (openedInIReal)
+                successDialog.text = "HTML file saved and opened directly with iReal Pro.";
+            else
+                successDialog.text = "HTML file saved, but macOS open did not finish.";
+
             successDialog.visible = true;
 
         }else{
