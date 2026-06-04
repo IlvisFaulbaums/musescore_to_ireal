@@ -1,9 +1,7 @@
 This converts not only chords (C, D-, E-, F,...) as described in original version of plugin.
 But also REPEATS |: :|    Time Signatures (2/4,3/4,4/4,5/4,...) and Voltas 1., 2.,....,
 Segnos, Codas and Jumps, intro, A,B,C,D and V parts.
-I want to add that if there are very many chords, but They are each in one bar, make the look compact and maybe Small mode Automatically.
-
-Lyrics and will be there in near future.
+Markers as lyrics, fermatas, small mode and large mode automatically.
 
 # MuseScore to iReal Pro Export Plugin
 
